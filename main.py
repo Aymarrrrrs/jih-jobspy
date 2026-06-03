@@ -15,12 +15,26 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 
 class ScrapeRequest(BaseModel):
-    keywords: List[str]
-    location: str = "Ottawa, Ontario, Canada"
-    hours_old: int = 168  # 7 days
-    results_per_keyword: int = 5  # reduced to avoid timeouts
+    # ── v2 fields (preferred) ─────────────────────────────────────────────────
+    # search_terms: list of job titles/queries to search for
+    # locations: list of locations to search in — scraper iterates search_terms × locations
+    search_terms: Optional[List[str]] = None
+    locations: Optional[List[str]] = None
+
+    # ── legacy fields (backward compat) ──────────────────────────────────────
+    keywords: Optional[List[str]] = None          # alias for search_terms
+    location: str = "Ottawa, Ontario, Canada"     # single location fallback
+
+    # ── common fields ─────────────────────────────────────────────────────────
+    hours_old: int = 168                          # jobs posted in last N hours (default 7 days)
+    results_per_keyword: int = 5                  # max results per search term per location
+    results_wanted: Optional[int] = None          # v2 alias for results_per_keyword (plan compat)
     sites: List[str] = ["linkedin", "indeed"]
     country: str = "Canada"
+    country_indeed: Optional[str] = None          # v2 alias for country
+
+    # ── body-based secret (alternative to x-secret header) ───────────────────
+    secret: Optional[str] = None
 
 
 @app.get("/ping")
@@ -34,13 +48,19 @@ async def health():
     return {"status": "ok", "service": "jih-jobspy-microservice"}
 
 
-def _scrape_keyword(keyword: str, sites: List[str], location: str,
-                    results_per_keyword: int, hours_old: int, country: str) -> List[dict]:
-    """Synchronous scrape for one keyword — runs in thread executor."""
+def _scrape_keyword_location(
+    keyword: str,
+    location: str,
+    sites: List[str],
+    results_per_keyword: int,
+    hours_old: int,
+    country: str,
+) -> List[dict]:
+    """Synchronous scrape for one keyword × one location — runs in thread executor."""
     from jobspy import scrape_jobs
     import pandas as pd
 
-    logger.info(f"Scraping keyword: '{keyword}' on {sites} in {location}")
+    logger.info(f"Scraping: '{keyword}' in '{location}' on {sites}")
     jobs = scrape_jobs(
         site_name=sites,
         search_term=keyword,
@@ -53,51 +73,70 @@ def _scrape_keyword(keyword: str, sites: List[str], location: str,
     )
 
     if jobs is None or len(jobs) == 0:
-        logger.info(f"Keyword '{keyword}': 0 results")
+        logger.info(f"'{keyword}' in '{location}': 0 results")
         return []
 
     jobs_list = jobs.where(pd.notnull(jobs), None).to_dict(orient="records")
     for job in jobs_list:
         job["search_keyword"] = keyword
+        job["search_location"] = location
         if not job.get("job_url"):
             job["job_url"] = job.get("id", "")
 
-    logger.info(f"Keyword '{keyword}': {len(jobs_list)} results")
+    logger.info(f"'{keyword}' in '{location}': {len(jobs_list)} results")
     return jobs_list
 
 
 @app.post("/scrape")
-async def scrape_jobs_endpoint(request: ScrapeRequest, x_secret: str = Header(None)):
-    if SCRAPE_SECRET and x_secret != SCRAPE_SECRET:
+async def scrape_jobs_endpoint(request: ScrapeRequest, x_secret: Optional[str] = Header(None)):
+    # Auth: accept either x-secret header or body secret param
+    effective_secret = x_secret or request.secret
+    if SCRAPE_SECRET and effective_secret != SCRAPE_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Resolve search terms: prefer v2 search_terms, fall back to legacy keywords
+    effective_terms = request.search_terms or request.keywords or []
+    if not effective_terms:
+        raise HTTPException(status_code=400, detail="Provide search_terms (or keywords)")
+
+    # Resolve locations: prefer v2 locations list, fall back to legacy single location
+    effective_locations = request.locations or [request.location]
+
+    # Resolve results per keyword: prefer v2 results_wanted alias
+    effective_results = request.results_wanted or request.results_per_keyword
+
+    # Resolve country: prefer v2 country_indeed alias
+    effective_country = request.country_indeed or request.country
 
     all_jobs = []
     errors = []
     loop = asyncio.get_event_loop()
 
-    for keyword in request.keywords:
-        try:
-            logger.info(f"Starting scrape for keyword: '{keyword}'")
-            jobs = await asyncio.wait_for(
-                loop.run_in_executor(
-                    executor,
-                    _scrape_keyword,
-                    keyword,
-                    request.sites,
-                    request.location,
-                    request.results_per_keyword,
-                    request.hours_old,
-                    request.country,
-                ),
-                timeout=60.0,
-            )
-            all_jobs.extend(jobs)
-        except asyncio.TimeoutError:
-            logger.warning(f"Keyword '{keyword}' timed out after 60s")
-            errors.append({"keyword": keyword, "error": "Timeout after 60s"})
-        except Exception as e:
-            logger.error(f"Keyword '{keyword}' failed: {e}")
-            errors.append({"keyword": keyword, "error": str(e)})
+    # Iterate search_terms × locations (v2 dynamic parameterisation)
+    for keyword in effective_terms:
+        for location in effective_locations:
+            try:
+                logger.info(f"Queuing: '{keyword}' in '{location}'")
+                jobs = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        executor,
+                        _scrape_keyword_location,
+                        keyword,
+                        location,
+                        request.sites,
+                        effective_results,
+                        request.hours_old,
+                        effective_country,
+                    ),
+                    timeout=60.0,
+                )
+                all_jobs.extend(jobs)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout: '{keyword}' in '{location}'")
+                errors.append({"keyword": keyword, "location": location, "error": "Timeout after 60s"})
+            except Exception as e:
+                logger.error(f"Failed: '{keyword}' in '{location}': {e}")
+                errors.append({"keyword": keyword, "location": location, "error": str(e)})
 
     # Deduplicate by job_url
     seen_urls: set = set()
@@ -110,10 +149,15 @@ async def scrape_jobs_endpoint(request: ScrapeRequest, x_secret: str = Header(No
         elif not url:
             unique_jobs.append(job)
 
-    logger.info(f"Scrape complete: {len(unique_jobs)} unique jobs, {len(errors)} errors")
+    logger.info(
+        f"Scrape complete: {len(unique_jobs)} unique jobs from "
+        f"{len(effective_terms)} terms × {len(effective_locations)} locations, "
+        f"{len(errors)} errors"
+    )
     return {
         "jobs": unique_jobs,
         "total": len(unique_jobs),
         "errors": errors,
-        "keywords_searched": request.keywords,
+        "keywords_searched": effective_terms,
+        "locations_searched": effective_locations,
     }
